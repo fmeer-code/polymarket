@@ -85,10 +85,6 @@ def format_market_tokens(markets):
     return formatted
 
 
-# Example Usage: Replace with the actual market slug
-# Example slug format is typically 'will-biden-be-reelected-in-2024'
-slug = "bun-mai-pau-2025-12-21"
-
 def get_tokens_for_market(slug):
     market_info = get_market_by_slug(slug)
 
@@ -102,8 +98,13 @@ def get_tokens_for_market(slug):
         #print(json.dumps(formatted_tokens, indent=4))
     else:
         print(f"Could not retrieve market for slug: {slug}")
-        return "Could not retrieve market data."
+        return None
     
     return formatted_tokens
 
-print(get_tokens_for_market(slug))
+
+if __name__ == "__main__":
+    # Example usage
+    example_slug = "bun-mai-pau-2025-12-21"
+    tokens = get_tokens_for_market(example_slug)
+    print(tokens)

@@ -2,6 +2,7 @@ import os
 import time
 from dotenv import load_dotenv
 from py_clob_client.client import ClobClient
+from get_market import get_tokens_for_market
 from fast_goal_bet import (
     PriceTracker,
     get_market_data,
@@ -9,14 +10,20 @@ from fast_goal_bet import (
     CHAIN_ID,
     PRIVATE_KEY,
     POLYMARKET_PROXY_ADDRESS,
-    HOME_TOKEN_ID,
-    AWAY_TOKEN_ID,
+    SLUG
 )
 
 
 def main():
     # Ensure env vars are loaded in case this file is run directly
     load_dotenv(override=True)
+
+    tokens = get_tokens_for_market(SLUG) or {}
+
+    HOME_TOKEN_ID = tokens.get("home-yes")
+    AWAY_TOKEN_ID = tokens.get("away-yes")
+    if not HOME_TOKEN_ID or not AWAY_TOKEN_ID:
+        raise ValueError(f"Could not resolve token ids for slug '{SLUG}'. Got: {tokens}")
 
     client = ClobClient(
         HOST,
@@ -44,8 +51,8 @@ def main():
                 if current is None or old is None:
                     print(f"{label}: price unavailable (network error?)")
                     continue
-                change_pct = ((current - old) / old * 100) if old else 0.0
-                print(f"{label}: current={current:.4f} | 1m_ago={old:.4f} | Δ1m={change_pct:+.2f}%")
+                change_cents = (current - old) * 100  # show move in cents instead of percent
+                print(f"{label}: current={current:.4f} | 1m_ago={old:.4f} | Δ1m={change_cents:+.2f}¢")
             time.sleep(5)
     except KeyboardInterrupt:
         pass

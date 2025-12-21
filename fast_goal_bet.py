@@ -8,7 +8,7 @@ from py_clob_client.clob_types import OrderArgs, OrderType
 from py_clob_client.order_builder.constants import BUY, SELL
 from py_clob_client.exceptions import PolyApiException
 import requests
-from get_market import get_market_by_slug
+from get_market import get_tokens_for_market
 
 # Always re-read .env so edits take effect even if variables are already set
 load_dotenv(override=True)
@@ -23,12 +23,15 @@ print(PRIVATE_KEY,"   " ,POLYMARKET_PROXY_ADDRESS)
 if not PRIVATE_KEY or not POLYMARKET_PROXY_ADDRESS:
     raise ValueError("PRIVATE_KEY and POLYMARKET_PROXY_ADDRESS must be set in the environment")
 
-slug = "soccer-world-cup-2022-final-match-winner"
+SLUG = "bun-mai-pau-2025-12-21"
 
-tokens = get_market_by_slug(slug)
+tokens = get_tokens_for_market(SLUG) or {}
 
 HOME_TOKEN_ID = tokens.get("home-yes")
 AWAY_TOKEN_ID = tokens.get("away-yes")
+
+if not HOME_TOKEN_ID or not AWAY_TOKEN_ID:
+    raise ValueError(f"Could not resolve token ids for slug '{SLUG}'. Got: {tokens}")
 
 # The amount of USDC you want to spend (approximate, since orders are in shares)
 TRADE_AMOUNT_USDC = 2
@@ -224,8 +227,8 @@ def cash_out(client, token_id, filled_shares, tracker=None):
             print("Cannot fetch price to cash out.")
             return
 
-    # Slightly undercut the market to improve fill odds
-    limit_price = round(max(0.01, current_price * 0.97), 2)
+    # Slightly undercut the market by 2 cents to improve fill odds
+    limit_price = round(max(0.01, current_price - 0.02), 2)
     print(f"Submitting cash-out sell: {filled_shares} shares at ${limit_price}...")
 
     order_args = OrderArgs(
@@ -266,19 +269,21 @@ def execute_trade(client, token_id, tracker):
         print("Price data unavailable or invalid; skipping trade.")
         return
     
-    # Check if price changed by more than 2%
-    price_change = abs((current_price - old_price) / old_price)
+    # Check if price changed by more than 10 cents
+    price_change = abs(current_price - old_price)
     
     print(f"Current Price: {current_price:.4f} | 1m Ago: {old_price:.4f}")
-    print(f"Price Change: {price_change*100:.2f}%")
+    print(f"Price Change: ${price_change:.2f}")
 
     if price_change > 0.1:
-        print("Price changed by > 10% in the last 1 min. Trade aborted.")
+        print("Price changed by > $0.10 in the last 1 min. Trade aborted.")
         return
 
-    # Set limit price 2% over market (Aggressive Fill)
-    limit_price = round(current_price * 1.05, 2)
-    if limit_price > 0.9: limit_price = 0.9 # Cap at 0.9
+    # Set limit price 5 cents over market (Aggressive Fill)
+    limit_price = round(current_price + 0.05, 2)
+    if limit_price > 0.9:
+        print("Limit price capped at $0.90.")
+        return
     
     # Calculate shares: (Amount / Price)
     shares = round(TRADE_AMOUNT_USDC / limit_price, 2)
