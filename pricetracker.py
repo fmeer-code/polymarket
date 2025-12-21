@@ -2,7 +2,7 @@ import os
 import time
 from dotenv import load_dotenv
 from py_clob_client.client import ClobClient
-from simple import (
+from fast_goal_bet import (
     PriceTracker,
     get_market_data,
     HOST,

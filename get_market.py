@@ -45,13 +45,65 @@ def extract_questions_outcomes_token_ids(market_data):
     return results
 
 
+def format_market_tokens(markets):
+    """
+    Formats markets into a home/draw/away token mapping:
+    {
+        home-yes: <token>,
+        home-no: <token>,
+        draw-yes: <token>,
+        draw-no: <token>,
+        away-yes: <token>,
+        away-no: <token>
+    }
+    """
+    formatted = {}
+    team_slots = ["home", "away"]
+
+    for market in markets:
+        question = market.get("question", "")
+        outcomes = market.get("outcomes", [])
+        token_ids = market.get("tokenIds", [])
+
+        # Align tokens with outcomes in case the API returns them in a different order.
+        outcome_token_map = {
+            outcome.lower(): token for outcome, token in zip(outcomes, token_ids)
+        }
+        yes_token = outcome_token_map.get("yes") or (token_ids[0] if token_ids else None)
+        no_token = outcome_token_map.get("no") or (token_ids[1] if len(token_ids) > 1 else None)
+
+        if "draw" in question.lower():
+            prefix = "draw"
+        else:
+            prefix = team_slots.pop(0) if team_slots else f"team-{len(formatted)//2}"
+
+        if yes_token:
+            formatted[f"{prefix}-yes"] = yes_token
+        if no_token:
+            formatted[f"{prefix}-no"] = no_token
+
+    return formatted
+
+
 # Example Usage: Replace with the actual market slug
 # Example slug format is typically 'will-biden-be-reelected-in-2024'
-slug = "lal-lev-vil-2025-12-14"
-market_info = get_market_by_slug(slug)
+slug = "bun-mai-pau-2025-12-21"
 
-if market_info:
-    trimmed = extract_questions_outcomes_token_ids(market_info)
-    print(json.dumps(trimmed, indent=4))
-else:
-    print(f"Could not retrieve market for slug: {slug}")
+def get_tokens_for_market(slug):
+    market_info = get_market_by_slug(slug)
+
+    if market_info:
+        trimmed = extract_questions_outcomes_token_ids(market_info)
+        #print("Raw markets:")
+        #print(json.dumps(trimmed, indent=4))
+
+        formatted_tokens = format_market_tokens(trimmed)
+        #print("\nFormatted tokens:")
+        #print(json.dumps(formatted_tokens, indent=4))
+    else:
+        print(f"Could not retrieve market for slug: {slug}")
+        return "Could not retrieve market data."
+    
+    return formatted_tokens
+
+print(get_tokens_for_market(slug))
