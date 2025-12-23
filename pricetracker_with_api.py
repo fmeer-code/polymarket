@@ -1,15 +1,10 @@
 import os
 import time
 from dotenv import load_dotenv
-from py_clob_client.client import ClobClient
 from get_market import get_tokens_for_market
+from helpers import PriceTracker, get_market_data, create_client
 from fast_goal_bet import (
-    PriceTracker,
-    get_market_data,
-    HOST,
-    CHAIN_ID,
-    PRIVATE_KEY,
-    POLYMARKET_PROXY_ADDRESS,
+
     SLUG
 )
 
@@ -20,23 +15,16 @@ def main():
 
     tokens = get_tokens_for_market(SLUG) or {}
 
-    HOME_TOKEN_ID = tokens.get("home-yes")
-    AWAY_TOKEN_ID = tokens.get("away-yes")
-    if not HOME_TOKEN_ID or not AWAY_TOKEN_ID:
+    HOME_YES = tokens.get("home-yes")
+    AWAY_YES = tokens.get("away-yes")
+    if not HOME_YES or not AWAY_YES:
         raise ValueError(f"Could not resolve token ids for slug '{SLUG}'. Got: {tokens}")
 
-    client = ClobClient(
-        HOST,
-        key=PRIVATE_KEY,
-        chain_id=CHAIN_ID,
-        signature_type=1,
-        funder=POLYMARKET_PROXY_ADDRESS,
-    )
-    client.set_api_creds(client.create_or_derive_api_creds())
+    client = create_client()
 
     tokens = {
-        "HOME": HOME_TOKEN_ID,
-        "AWAY": AWAY_TOKEN_ID,
+        "HOME": HOME_YES,
+        "AWAY": AWAY_YES,
     }
 
     tracker = PriceTracker(client, token_ids=list(tokens.values()))
@@ -53,7 +41,7 @@ def main():
                     continue
                 change_cents = (current - old) * 100  # show move in cents instead of percent
                 print(f"{label}: current={current:.4f} | 1m_ago={old:.4f} | Δ1m={change_cents:+.2f}¢")
-            time.sleep(5)
+            time.sleep(0.5)
     except KeyboardInterrupt:
         pass
     finally:
