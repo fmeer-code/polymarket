@@ -16,7 +16,7 @@ def plot_lag_data(filename: str):
         df = pd.read_csv(filename)
 
         # 2) Validate columns
-        required = {"timestamp", "token", "price", "notional_usd"}
+        required = {"timestamp", "token", "price", "notional_usd", "trigger_ts"}
         missing = required - set(df.columns)
         if missing:
             raise KeyError(f"Missing columns: {sorted(missing)}")
@@ -25,10 +25,15 @@ def plot_lag_data(filename: str):
         df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
         df["price"] = pd.to_numeric(df["price"], errors="coerce")
         df["notional_usd"] = pd.to_numeric(df["notional_usd"], errors="coerce")
+        df["trigger_ts"] = pd.to_datetime(df["trigger_ts"], utc=True, errors="coerce")
         df = df.dropna(subset=["timestamp", "token", "price", "notional_usd"]).copy()
 
         # Optional: make timestamps naive local or keep UTC; here we keep UTC but remove tz for matplotlib
         df["time"] = df["timestamp"].dt.tz_convert("UTC").dt.tz_localize(None)
+        first_trigger = df["trigger_ts"].dropna().min()
+        trigger_time = (
+            first_trigger.tz_convert("UTC").tz_localize(None) if pd.notnull(first_trigger) else None
+        )
 
         # 4) Split by token and sort
         leader = df[df["token"].str.upper() == "LEADER"].sort_values("time")
@@ -61,6 +66,11 @@ def plot_lag_data(filename: str):
         ax.set_ylabel("Price (USD)", fontsize=12)
         ax.set_xlabel("Time (UTC)", fontsize=12)
         ax.grid(True, which="major", linestyle="--", alpha=0.7)
+
+        # Mark the first trigger timestamp
+        if trigger_time is not None:
+            ax.axvline(trigger_time, color="red", linestyle=":", linewidth=2, label="First trigger")
+
         ax.legend(fontsize=12)
 
         # Show milliseconds on the x-axis to match CSV precision
@@ -115,5 +125,5 @@ def plot_lag_data(filename: str):
 
 if __name__ == "__main__":
     # Run: python plotter.py  (or edit filename below)
-    file_to_plot = "capture_1766585862.937099_guinea.csv"
+    file_to_plot = "capture_1766658816.893386.csv"
     plot_lag_data(file_to_plot)

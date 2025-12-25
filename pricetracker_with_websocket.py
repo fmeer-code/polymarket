@@ -38,7 +38,7 @@ PRINT_INTERVAL = 0.5        # how often to refresh the screen
 PING_INTERVAL = 10          # keepalive
 RECONNECT_MAX_BACKOFF = 30  # seconds
 
-TRIGGER_AMOUNT = 0.03      # USD price move on leader to trigger capture
+TRIGGER_AMOUNT = 0.01      # USD price move on leader to trigger capture
 STALE_OLD_SECONDS = 300  # only mark "old" as unavailable after 5 minutes without trades
 
 def _now_s() -> float:
@@ -295,11 +295,14 @@ async def ws_run(asset_ids, labels: Dict[str, str]):
             return
         for cap in finished:
             filename = f"capture_{cap['started_at']}.csv"
+            trigger_ts_iso = _ts_to_iso(cap["started_at"])
             with open(filename, "w", newline="") as f:
                 writer = csv.writer(f)
-                writer.writerow(["timestamp", "token", "price", "notional_usd"])
+                writer.writerow(["timestamp", "token", "price", "notional_usd", "trigger_ts"])
                 for row in cap["trades"]:
-                    writer.writerow([_ts_to_iso(row["ts"]), row["token"], row["price"], row["size"]])
+                    writer.writerow(
+                        [_ts_to_iso(row["ts"]), row["token"], row["price"], row["size"], trigger_ts_iso]
+                    )
             print(f"Captured trades written to {filename}")
         captures = [c for c in captures if now_s < c["end_ts"]]
 
@@ -449,8 +452,8 @@ async def ws_run(asset_ids, labels: Dict[str, str]):
 def main():
     load_dotenv(override=True)
 
-    leader_token = "89884975119324541734023674040273698067050774915985018635745294568292670695924"
-    lagger_token = "43444484953307067497949002485007513712813674952491389537324272931320530568295"
+    leader_token = "81965132148053589449499920541031133901384216591712497808246133087025335332803"
+    lagger_token = "111160063407071262950390288172962217906459250371514775466225392390813944906959"
 
 
     labels = {"LEADER": leader_token, "LAGGER": lagger_token}
