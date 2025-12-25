@@ -9,6 +9,38 @@ from py_clob_client.client import ClobClient
 import os
 from dotenv import load_dotenv
 
+
+def _format_poly_exception(exc: PolyApiException) -> str:
+    """
+    Extract as much detail as possible from PolyApiException so failures are visible in the UI.
+    """
+    parts = []
+    msg = str(getattr(exc, "error_message", "")) or str(exc)
+    if msg:
+        parts.append(msg)
+    code = getattr(exc, "code", None) or getattr(exc, "error_code", None)
+    if code:
+        parts.append(f"code={code}")
+    resp = getattr(exc, "response", None)
+    if resp is not None:
+        status = getattr(resp, "status_code", None)
+        text = None
+        try:
+            text = resp.text
+        except Exception:
+            text = None
+        meta = []
+        if status:
+            meta.append(f"status={status}")
+        if text:
+            meta.append(f"body={text}")
+        if meta:
+            parts.append("response(" + ", ".join(meta) + ")")
+    args = getattr(exc, "args", None)
+    if args:
+        parts.append(f"args={args}")
+    return " | ".join(parts)
+
 def create_client():
     # Always re-read .env so edits take effect even if variables are already set
     load_dotenv(override=True)
@@ -18,8 +50,6 @@ def create_client():
     CHAIN_ID = 137  # Polygon Mainnet
     PRIVATE_KEY = os.getenv("PRIVATE_KEY", "").strip()
     POLYMARKET_PROXY_ADDRESS = os.getenv("POLYMARKET_PROXY_ADDRESS", "").strip()
-    print(PRIVATE_KEY,"   " ,POLYMARKET_PROXY_ADDRESS)
-
     if not PRIVATE_KEY or not POLYMARKET_PROXY_ADDRESS:
         raise ValueError("PRIVATE_KEY and POLYMARKET_PROXY_ADDRESS must be set in the environment")
     client = ClobClient(HOST, key=PRIVATE_KEY, chain_id=CHAIN_ID, signature_type=1, funder=POLYMARKET_PROXY_ADDRESS)
@@ -203,6 +233,15 @@ def monitor_order(client, order_id, original_size, timeout=180):
 
     return last_status, last_filled
 
+def cancel_order(client, order_id):
+    try:
+        if hasattr(client, "cancel_order"):
+            client.cancel_order(order_id)
+            return True
+    except Exception:
+        return False
+    return False
+
 def cash_out(client, token_id, filled_shares, tracker=None):
     """Submit a simple limit-sell to exit the filled position."""
     if filled_shares <= 0:
@@ -252,6 +291,7 @@ def cash_out(client, token_id, filled_shares, tracker=None):
     except Exception as exc:
         print(f"Cash-out order failed: {exc}")
 
+
 def execute_trade(client, token_id, tracker, TRADE_AMOUNT_USDC):
     current_price, old_price = get_market_data(client, token_id, tracker)
 
@@ -278,7 +318,7 @@ def execute_trade(client, token_id, tracker, TRADE_AMOUNT_USDC):
     # Calculate shares: (Amount / Price)
     shares = round(TRADE_AMOUNT_USDC / limit_price, 2)
 
-    print(f"Placing Limit Order: {shares} shares at ${limit_price}...")
+    print(f"Placing Limit Order: {shares} shares at ${limit_price} (token {token_id}) based on lagger price {lagger_price_1m_ago:.4f}...")
     
     order_args = OrderArgs(
         price=limit_price,
@@ -305,3 +345,100 @@ def execute_trade(client, token_id, tracker, TRADE_AMOUNT_USDC):
         print(f"Order {status}. Filled {filled} shares.")
     else:
         print(f"Order monitoring ended without fill. Last status: {status or 'unknown'}.")
+
+def execute_trade_lagger(client, token_id, lagger_price_1m_ago, trigger_amount, TRADE_AMOUNT_USDC, monitor_timeout=20):
+    status = "error"
+    filled = 0.0
+
+    # Set limit price 5 cents over market (Aggressive Fill)
+    limit_price = round(lagger_price_1m_ago + trigger_amount, 2)
+    if limit_price > 0.9:
+        print("Limit price capped at $0.90.")
+        return "skipped_limit", filled
+    
+    # Calculate shares: (Amount / Price)
+    shares = round(TRADE_AMOUNT_USDC / limit_price, 2)
+
+    print(f"Placing Limit Order: {shares} shares at ${limit_price}...")
+    
+    order_args = OrderArgs(
+        price=limit_price,
+        size=shares,
+        side=BUY,
+        token_id=token_id
+    )
+    
+    try:
+        signed_order = client.create_order(order_args)
+        resp = client.post_order(signed_order, OrderType.GTC)
+        order_id = extract_order_id(resp)
+        if not order_id:
+            print("Order submission failed: no order id returned.")
+            return "no_order_id", filled
+        print(f"Order submitted (id: {order_id})")
+    except PolyApiException as exc:
+        detail = _format_poly_exception(exc)
+        status = "submit_error"
+        if "balance" in detail.lower():
+            status = "insufficient_balance"
+        elif "allowance" in detail.lower() or "approval" in detail.lower():
+            status = "allowance_needed"
+        print(f"Lagger order failed: {detail}")
+        return status, filled
+    except Exception as exc:
+        print(f"Lagger order failed: {type(exc).__name__}: {exc}")
+        return "submit_error", filled
+
+    status, filled = monitor_order(client, order_id, shares, timeout=monitor_timeout)
+    if status in ("filled", "closed", "matched"):
+        print(f"Order filled ({filled} shares).")
+        user_choice = input("Press 's' to cash out now, anything else to continue: ").strip().lower()
+        if user_choice == "s":
+            cash_out_lagger(client, token_id, filled, limit_price)
+    elif status in ("cancelled", "expired"):
+        print(f"Order {status}. Filled {filled} shares.")
+    else:
+        print(f"Order monitoring ended without fill. Last status: {status or 'unknown'}.")
+        if cancel_order(client, order_id):
+            print("Unfilled order cancelled after timeout.")
+            status = "cancelled"
+        else:
+            print("Order cancel attempt failed or not supported.")
+    return status, filled
+
+def cash_out_lagger(client, token_id, filled_shares,limit_price):
+    """Submit a simple limit-sell to exit the filled position."""
+    if filled_shares <= 0:
+        print("No filled size to cash out.")
+        return
+
+    order_args = OrderArgs(
+        price=limit_price,
+        size=filled_shares,
+        side=SELL,
+        token_id=token_id
+    )
+
+    try:
+        signed_order = client.create_order(order_args)
+        resp = client.post_order(signed_order, OrderType.GTC)
+        order_id = extract_order_id(resp)
+        if not order_id:
+            print("Cash-out submission failed (no order id).")
+            return
+        print(f"Cash-out submitted (id: {order_id})")
+        status, filled = monitor_order(client, order_id, filled_shares, timeout=120)
+        if status in ("filled", "closed", "matched"):
+            print(f"Cash-out filled ({filled} shares).")
+        elif status in ("cancelled", "expired"):
+            print(f"Cash-out {status}. Filled {filled} shares.")
+        else:
+            print(f"Cash-out monitoring ended without fill. Last status: {status or 'unknown'}.")
+    except PolyApiException as exc:
+        msg = str(getattr(exc, "error_message", "")) or str(exc)
+        if "not enough balance" in msg.lower():
+            print("Cash-out skipped: no balance/allowance (likely already sold).")
+        else:
+            print(f"Cash-out order failed: {msg}")
+    except Exception as exc:
+        print(f"Cash-out order failed: {exc}")

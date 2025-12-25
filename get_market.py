@@ -105,6 +105,6 @@ def get_tokens_for_market(slug):
 
 if __name__ == "__main__":
     # Example usage
-    example_slug = "cs2-efa-mana-2025-12-23"
+    example_slug = "acn-cmr-gab-2025-12-24"
     tokens = get_tokens_for_market(example_slug)
     print(tokens)

@@ -19,15 +19,15 @@ Assumptions:
 
 import os
 import json
+import random
 import time
 import asyncio
-import csv
-from datetime import datetime, timezone
 from collections import deque
 from typing import Dict, Optional, Tuple, List
 
 import websockets
 from dotenv import load_dotenv
+from helpers import create_client, execute_trade_lagger
 
 
 WSS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
@@ -38,16 +38,19 @@ PRINT_INTERVAL = 0.5        # how often to refresh the screen
 PING_INTERVAL = 10          # keepalive
 RECONNECT_MAX_BACKOFF = 30  # seconds
 
-TRIGGER_AMOUNT = 0.03      # USD price move on leader to trigger capture
+TRIGGER_AMOUNT = 0.1      # USD price move on leader to trigger capture
+TRADE_AMOUNT_USDC = 10.0    # notional USD amount to trade on lagger when triggered
+ORDER_MONITOR_TIMEOUT = 20  # seconds to wait before resuming price checks if not filled
+TRADE_COOLDOWN_SECONDS = LOOKBACK_SECONDS  # prevent repeated orders off same move window
 STALE_OLD_SECONDS = 300  # only mark "old" as unavailable after 5 minutes without trades
 
-def _now_s() -> float:
-    return time.time()
+def _now_s() -> int:
+    return int(time.time())
 
 
-def _ts_ms_to_s(ts_ms: Optional[str]) -> float:
+def _ts_ms_to_s(ts_ms: Optional[str]) -> int:
     try:
-        return float(ts_ms) / 1000.0
+        return int(int(ts_ms) / 1000)
     except Exception:
         return _now_s()
 
@@ -189,7 +192,7 @@ class TokenState:
 
         cur_ts_s, cur_price, _cur_size = self.trade_history[-1]
 
-        # If the latest trade itself is older than the stale window, mark old as unavailable.
+        # No trade in the stale window; we consider "old" unavailable.
         if now_s - cur_ts_s >= STALE_OLD_SECONDS:
             return cur_price, None
 
@@ -218,7 +221,7 @@ async def ping_loop(ws: websockets.WebSocketClientProtocol, interval: int = PING
         await asyncio.sleep(interval)
 
 
-async def printer_loop(labels: Dict[str, str], state: Dict[str, TokenState], lock: asyncio.Lock):
+async def printer_loop(labels: Dict[str, str], state: Dict[str, TokenState], lock: asyncio.Lock, order_state: Dict[str, str]):
     while True:
         os.system("clear" if os.name == "posix" else "cls")
         print("--- WS Price Tracker (last trade as current price) ---")
@@ -227,6 +230,15 @@ async def printer_loop(labels: Dict[str, str], state: Dict[str, TokenState], loc
         print()
 
         async with lock:
+            if order_state.get("active"):
+                print("Order: active (monitoring lagger order, price updates paused)")
+            elif order_state.get("last_status"):
+                last_status = order_state["last_status"]
+                if last_status == "skipped_limit":
+                    print("Order: limit_price capped at $0.90")
+                else:
+                    print(f"Order: last status = {last_status}")
+
             for label, asset_id in labels.items():
                 st = state.get(asset_id)
                 if not st:
@@ -266,52 +278,52 @@ async def printer_loop(labels: Dict[str, str], state: Dict[str, TokenState], loc
         await asyncio.sleep(PRINT_INTERVAL)
 
 
-def _ts_to_iso(ts_s: float) -> str:
-    dt = datetime.fromtimestamp(ts_s, tz=timezone.utc)
-    # Keep millisecond precision; strip microseconds beyond 3 digits.
-    return dt.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+def _ts_to_iso(ts_s: int) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts_s))
 
 
-async def ws_run(asset_ids, labels: Dict[str, str]):
+async def ws_run(asset_ids, labels: Dict[str, str], client):
     # shared state
     state: Dict[str, TokenState] = {aid: TokenState(LOOKBACK_SECONDS) for aid in asset_ids}
     lock = asyncio.Lock()
-    captures: List[Dict] = []
-    label_by_asset = {aid: label for label, aid in labels.items()}
+    order_state: Dict[str, str] = {"active": False, "last_status": "", "cooldown_until": 0}
 
-    def append_past_trades(window_start: int, trigger_ts: int, bucket: List[Dict]):
-        # Grab trades from the minute before the trigger up to the trigger time.
-        for aid, label in label_by_asset.items():
-            st = state.get(aid)
-            if not st:
-                continue
-            for ts, price, size in st.get_recent_trades(window_start, trigger_ts):
-                bucket.append({"token": label, "ts": ts, "price": price, "size": size})
+    leader_aid = labels.get("LEADER")
+    lagger_aid = labels.get("LAGGER")
+    if not leader_aid or not lagger_aid:
+        raise ValueError("Both LEADER and LAGGER token ids are required.")
 
-    def maybe_finish_captures(now_s: int):
-        nonlocal captures
-        finished = [c for c in captures if now_s >= c["end_ts"]]
-        if not finished:
-            return
-        for cap in finished:
-            filename = f"capture_{cap['started_at']}.csv"
-            with open(filename, "w", newline="") as f:
-                writer = csv.writer(f)
-                writer.writerow(["timestamp", "token", "price", "notional_usd"])
-                for row in cap["trades"]:
-                    writer.writerow([_ts_to_iso(row["ts"]), row["token"], row["price"], row["size"]])
-            print(f"Captured trades written to {filename}")
-        captures = [c for c in captures if now_s < c["end_ts"]]
+    async def run_lagger_trade(lagger_reference_price: float):
+        loop = asyncio.get_running_loop()
+        try:
+            status, filled = await loop.run_in_executor(
+                None,
+                lambda: execute_trade_lagger(
+                    client,
+                    lagger_aid,
+                    lagger_reference_price,
+                    TRIGGER_AMOUNT,
+                    TRADE_AMOUNT_USDC,
+                    monitor_timeout=ORDER_MONITOR_TIMEOUT,
+                ),
+            )
+        except Exception as exc:
+            print(f"Lagger trade task failed: {exc}")
+            status, filled = "error", 0.0
+        async with lock:
+            order_state["active"] = False
+            order_state["last_status"] = status or "timeout"
+        return status, filled
 
-    printer_task = asyncio.create_task(printer_loop(labels, state, lock))
-    async def capture_watcher():
-        while True:
-            await asyncio.sleep(1)
-            async with lock:
-                if captures:
-                    maybe_finish_captures(_now_s())
-
-    capture_task = asyncio.create_task(capture_watcher())
+    printer_task = asyncio.create_task(printer_loop(labels, state, lock, order_state))
+    current_order_task: Optional[asyncio.Task] = None
+    def _on_order_done(task: asyncio.Task):
+        nonlocal current_order_task
+        try:
+            task.result()
+        except Exception as exc:
+            print(f"Lagger order task error: {exc}")
+        current_order_task = None
 
     backoff = 1
     try:
@@ -340,7 +352,6 @@ async def ws_run(asset_ids, labels: Dict[str, str]):
                         events = data if isinstance(data, list) else [data]
 
                         async with lock:
-                            recorded_trades = []
                             for msg in events:
                                 if not isinstance(msg, dict):
                                     continue
@@ -360,8 +371,6 @@ async def ws_run(asset_ids, labels: Dict[str, str]):
                                         asks=asks,
                                         last_trade_price=msg.get("last_trade_price"),
                                     )
-                                    if rec:
-                                        recorded_trades.append((aid, rec))
 
                                 elif et == "price_change":
                                     pcs = msg.get("price_changes") or []
@@ -381,54 +390,39 @@ async def ws_run(asset_ids, labels: Dict[str, str]):
                                     aid = msg.get("asset_id")
                                     if aid not in state:
                                         continue
-                                    rec = state[aid].update_from_last_trade(
+                                    state[aid].update_from_last_trade(
                                         ts_s,
                                         price=msg.get("price"),
                                         side=msg.get("side"),
                                         size=msg.get("size"),
                                     )
-                                    if rec:
-                                        recorded_trades.append((aid, rec))
 
                                 else:
                                     # tick_size_change or unknown event types: ignore
                                     pass
 
+                            cur, old = state[leader_aid].get_current_and_old_trade()
                             now_s = _now_s()
-                            leader_aid = labels.get("LEADER")
-                            if leader_aid in state:
-                                cur, old = state[leader_aid].get_current_and_old_trade()
-                                if cur is not None and old is not None and (cur - old) > TRIGGER_AMOUNT:
-                                    # Only allow one capture at a time; ignore repeated triggers while window is active.
-                                    if not captures:
-                                        trigger_ts = now_s
-                                        new_capture = {
-                                            "started_at": trigger_ts,
-                                            "start_ts": trigger_ts - LOOKBACK_SECONDS,
-                                            "end_ts": trigger_ts + LOOKBACK_SECONDS,
-                                            "trades": [],
-                                        }
-                                        append_past_trades(
-                                            new_capture["start_ts"], trigger_ts, new_capture["trades"]
-                                        )
-                                        captures.append(new_capture)
-
-                            if recorded_trades and captures:
-                                for aid, rec in recorded_trades:
-                                    label = label_by_asset.get(aid, aid)
-                                    for cap in captures:
-                                        if cap["start_ts"] <= rec["ts"] <= cap["end_ts"]:
-                                            cap["trades"].append(
-                                                {
-                                                    "token": label,
-                                                    "ts": rec["ts"],
-                                                    "price": rec["price"],
-                                                    "size": rec["size"],
-                                                }
-                                            )
-
-                            if captures:
-                                maybe_finish_captures(now_s)
+                            if (
+                                (not order_state["active"])
+                                and now_s >= order_state.get("cooldown_until", 0)
+                                and cur is not None
+                                and old is not None
+                                and (cur - old) > TRIGGER_AMOUNT
+                            ):
+                                lagger_cur, lagger_old = state[lagger_aid].get_current_and_old_trade()
+                                lagger_reference_price = lagger_old or lagger_cur
+                                if lagger_reference_price is not None:
+                                    order_state["active"] = True
+                                    order_state["last_status"] = "submitting"
+                                    order_state["cooldown_until"] = now_s + TRADE_COOLDOWN_SECONDS
+                                    current_order_task = asyncio.create_task(run_lagger_trade(lagger_reference_price))
+                                    current_order_task.add_done_callback(_on_order_done)
+                                    #get random number between 1000 and 5000
+                                    random_number = random.randint(1000, 5000)
+                                    #save a timestap to a txt file
+                                    with open(f"last_trade_timestamp_{random_number}.txt", "w") as f:
+                                        f.write(_ts_to_iso(now_s))
 
                     # socket ended
                     pinger.cancel()
@@ -443,11 +437,13 @@ async def ws_run(asset_ids, labels: Dict[str, str]):
 
     finally:
         printer_task.cancel()
-        capture_task.cancel()
+        if current_order_task:
+            current_order_task.cancel()
 
 
 def main():
     load_dotenv(override=True)
+    client = create_client()
 
     leader_token = "89884975119324541734023674040273698067050774915985018635745294568292670695924"
     lagger_token = "43444484953307067497949002485007513712813674952491389537324272931320530568295"
@@ -456,7 +452,7 @@ def main():
     labels = {"LEADER": leader_token, "LAGGER": lagger_token}
     asset_ids = list(labels.values())
 
-    asyncio.run(ws_run(asset_ids, labels))
+    asyncio.run(ws_run(asset_ids, labels, client))
 
 
 if __name__ == "__main__":
