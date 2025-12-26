@@ -392,9 +392,6 @@ def execute_trade_lagger(client, token_id, lagger_price_1m_ago, trigger_amount, 
     status, filled = monitor_order(client, order_id, shares, timeout=monitor_timeout)
     if status in ("filled", "closed", "matched"):
         print(f"Order filled ({filled} shares).")
-        user_choice = input("Press 's' to cash out now, anything else to continue: ").strip().lower()
-        if user_choice == "s":
-            cash_out_lagger(client, token_id, filled, limit_price)
     elif status in ("cancelled", "expired"):
         print(f"Order {status}. Filled {filled} shares.")
     else:

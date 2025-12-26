@@ -10,7 +10,17 @@ except ImportError:
     mplcursors = None
 
 
-def plot_lag_data(filename: str):
+def _coerce_api_time(value):
+    """Return naive UTC datetime or None."""
+    if value is None:
+        return None
+    ts = pd.to_datetime(value, utc=True, errors="coerce")
+    if pd.isna(ts):
+        return None
+    return ts.tz_convert("UTC").tz_localize(None)
+
+
+def plot_lag_data(filename: str, api_1=None, api_2=None, api_3=None):
     try:
         # 1) Load data
         df = pd.read_csv(filename)
@@ -71,6 +81,20 @@ def plot_lag_data(filename: str):
         if trigger_time is not None:
             ax.axvline(trigger_time, color="red", linestyle=":", linewidth=2, label="First trigger")
 
+        # Optional manual API markers
+        api_values = [api_1, api_2, api_3]
+        api_colors = ["purple", "green", "black"]
+        for idx, value in enumerate(api_values, start=1):
+            api_time = _coerce_api_time(value)
+            if api_time is not None:
+                ax.axvline(
+                    api_time,
+                    color=api_colors[idx - 1],
+                    linestyle="-.",
+                    linewidth=1.8,
+                    label=f"API {idx}",
+                )
+
         ax.legend(fontsize=12)
 
         # Show milliseconds on the x-axis to match CSV precision
@@ -126,4 +150,10 @@ def plot_lag_data(filename: str):
 if __name__ == "__main__":
     # Run: python plotter.py  (or edit filename below)
     file_to_plot = "capture_1766658816.893386.csv"
-    plot_lag_data(file_to_plot)
+
+    # Optional manual API timestamps (string/datetime). Leave as None to skip.
+    api_1 = None  # e.g., "2025-01-24T12:34:56.123Z"
+    api_2 = None
+    api_3 = None
+
+    plot_lag_data(file_to_plot, api_1=api_1, api_2=api_2, api_3=api_3)
