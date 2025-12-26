@@ -30,12 +30,16 @@ def plot_lag_data(filename: str, api_1=None, api_2=None, api_3=None):
         missing = required - set(df.columns)
         if missing:
             raise KeyError(f"Missing columns: {sorted(missing)}")
+        has_side = "side" in df.columns
 
         # 3) Parse timestamp and normalize types
         df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
         df["price"] = pd.to_numeric(df["price"], errors="coerce")
         df["notional_usd"] = pd.to_numeric(df["notional_usd"], errors="coerce")
         df["trigger_ts"] = pd.to_datetime(df["trigger_ts"], utc=True, errors="coerce")
+        if has_side:
+            # Keep side as string if present; NaN -> None
+            df["side"] = df["side"].astype("string").where(df["side"].notna(), None)
         df = df.dropna(subset=["timestamp", "token", "price", "notional_usd"]).copy()
 
         # Optional: make timestamps naive local or keep UTC; here we keep UTC but remove tz for matplotlib
@@ -124,12 +128,20 @@ def plot_lag_data(filename: str, api_1=None, api_2=None, api_3=None):
                 t = row["time"]
                 price = row["price"]
                 notional = row["notional_usd"]
+                side_val = row["side"] if has_side else None
+
+                # Gracefully handle missing/NA sides so hover still works
+                if has_side and pd.notna(side_val):
+                    side_txt = str(side_val).strip() or "unknown"
+                else:
+                    side_txt = "unknown"
 
                 sel.annotation.set_text(
                     f"{token}\n"
                     f"Time: {t.strftime('%H:%M:%S.%f')[:-3]}\n"
                     f"Price: {price:.4f}\n"
-                    f"USD: {notional:.4f}"
+                    f"USD: {notional:.4f}\n"
+                    f"Side: {side_txt}"
                 )
                 sel.annotation.get_bbox_patch().set(alpha=0.9)
 
@@ -149,10 +161,10 @@ def plot_lag_data(filename: str, api_1=None, api_2=None, api_3=None):
 
 if __name__ == "__main__":
     # Run: python plotter.py  (or edit filename below)
-    file_to_plot = "capture_1766658816.893386.csv"
+    file_to_plot = "capture_1766755277.846453_zimb.csv"
 
     # Optional manual API timestamps (string/datetime). Leave as None to skip.
-    api_1 = None  # e.g., "2025-01-24T12:34:56.123Z"
+    api_1 = "2025-12-26T13:21:11.000"  # e.g., "2025-01-24T12:34:56.123Z"
     api_2 = None
     api_3 = None
 

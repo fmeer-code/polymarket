@@ -11,7 +11,7 @@ if not API_KEY:
     raise SystemExit("Missing SPORTRADAR_API_KEY in environment or .env")
 
 team_query = ""
-date_str = "2025-12-25"
+date_str = "2025-12-26"
 url = f"https://api.sportradar.com/soccer/trial/v4/en/schedules/{date_str}/schedules.json"
 
 resp = requests.get(url, params={"api_key": API_KEY})

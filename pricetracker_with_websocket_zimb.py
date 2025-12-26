@@ -298,7 +298,7 @@ async def ws_run(asset_ids, labels: Dict[str, str]):
         if not finished:
             return
         for cap in finished:
-            filename = f"capture_{cap['started_at']}.csv"
+            filename = f"capture_{cap['started_at']}_zimb.csv"
             trigger_ts_iso = _ts_to_iso(cap["started_at"])
             with open(filename, "w", newline="") as f:
                 writer = csv.writer(f)
@@ -463,8 +463,8 @@ async def ws_run(asset_ids, labels: Dict[str, str]):
 def main():
     load_dotenv(override=True)
 
-    leader_token = "81965132148053589449499920541031133901384216591712497808246133087025335332803"
-    lagger_token = "111160063407071262950390288172962217906459250371514775466225392390813944906959"
+    leader_token = "7664375216546081278004193754121320196214806608455861571023638914574846312586"
+    lagger_token = "29088850551439014518249788475671867261380631556990954537436855779231827437665"
 
 
     labels = {"LEADER": leader_token, "LAGGER": lagger_token}

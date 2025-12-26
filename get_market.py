@@ -105,6 +105,6 @@ def get_tokens_for_market(slug):
 
 if __name__ == "__main__":
     # Example usage
-    example_slug = "lol-ig1-nip-2025-12-25"
+    example_slug = "acn-ang-zim-2025-12-26"
     tokens = get_tokens_for_market(example_slug)
     print(tokens)

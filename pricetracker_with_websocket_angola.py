@@ -298,7 +298,7 @@ async def ws_run(asset_ids, labels: Dict[str, str]):
         if not finished:
             return
         for cap in finished:
-            filename = f"capture_{cap['started_at']}.csv"
+            filename = f"capture_{cap['started_at']}_angola.csv"
             trigger_ts_iso = _ts_to_iso(cap["started_at"])
             with open(filename, "w", newline="") as f:
                 writer = csv.writer(f)
@@ -463,8 +463,8 @@ async def ws_run(asset_ids, labels: Dict[str, str]):
 def main():
     load_dotenv(override=True)
 
-    leader_token = "81965132148053589449499920541031133901384216591712497808246133087025335332803"
-    lagger_token = "111160063407071262950390288172962217906459250371514775466225392390813944906959"
+    leader_token = "54542413266558535349270021225413489345599446259775960590471155923999121070540"
+    lagger_token = "100093210590832382111243143092095025021086516619197048563664198138408372554136"
 
 
     labels = {"LEADER": leader_token, "LAGGER": lagger_token}
