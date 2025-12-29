@@ -4,7 +4,7 @@ Polymarket CLOB WebSocket Price Tracker (market channel)
 
 What it does (matches your REST tracker logic, but WS-fast):
 - Subscribes to the public market websocket for two token IDs (asset_ids)
-- Maintains ~60s rolling history per token of the last trade price
+- Maintains ~60s rolling history per token for Δ calculations, plus a longer buffer for captures
 - Prints: current last trade, ~1m_ago last trade, Δ1m in cents (if no trade in 1m, old=current)
 - Also tracks best_bid/best_ask and last_trade metadata when available
 - Handles the important gotcha: the initial "book" snapshot may arrive as a LIST of events.
@@ -33,7 +33,10 @@ from dotenv import load_dotenv
 WSS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
 LOOKBACK_SECONDS = 60
-TRADE_HISTORY_SECONDS = LOOKBACK_SECONDS * 2  # keep enough history to cover the capture window
+# capture window: 3 minutes before and after the trigger
+CAPTURE_WINDOW_BEFORE_SECONDS = 180
+CAPTURE_WINDOW_AFTER_SECONDS = 180
+TRADE_HISTORY_SECONDS = CAPTURE_WINDOW_BEFORE_SECONDS + CAPTURE_WINDOW_AFTER_SECONDS
 PRINT_INTERVAL = 1        # how often to refresh the screen
 PING_INTERVAL = 10          # keepalive
 RECONNECT_MAX_BACKOFF = 30  # seconds
@@ -95,7 +98,7 @@ class TokenState:
         self._trim(ts_s)
 
     def _trim_trades(self, now_s: int):
-        # keep enough history to cover capture window (~2 minutes)
+        # keep enough history to cover capture window
         while len(self.trade_history) > 1 and (now_s - self.trade_history[1][0] > TRADE_HISTORY_SECONDS):
             self.trade_history.popleft()
 
@@ -222,10 +225,10 @@ async def ping_loop(ws: websockets.WebSocketClientProtocol, interval: int = PING
         await asyncio.sleep(interval)
 
 
-async def printer_loop(labels: Dict[str, str], state: Dict[str, TokenState], lock: asyncio.Lock):
+async def printer_loop(labels: Dict[str, str], state: Dict[str, TokenState], name, lock: asyncio.Lock):
     while True:
         os.system("clear" if os.name == "posix" else "cls")
-        print("--- WS Price Tracker (last trade as current price) ---")
+        print(f"--- WS Price Tracker: {name} ---")
         print(f"WS: {WSS_URL}")
         print(f"Lookback: {LOOKBACK_SECONDS}s | Print: {PRINT_INTERVAL}s")
         print()
@@ -276,7 +279,7 @@ def _ts_to_iso(ts_s: float) -> str:
     return dt.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
-async def ws_run(asset_ids, labels: Dict[str, str]):
+async def ws_run(asset_ids, labels: Dict[str, str], name: str):
     # shared state
     state: Dict[str, TokenState] = {aid: TokenState(LOOKBACK_SECONDS) for aid in asset_ids}
     lock = asyncio.Lock()
@@ -298,7 +301,7 @@ async def ws_run(asset_ids, labels: Dict[str, str]):
         if not finished:
             return
         for cap in finished:
-            filename = f"capture_{cap['started_at']}.csv"
+            filename = f"capture_{cap['started_at']}_{name}.csv"
             trigger_ts_iso = _ts_to_iso(cap["started_at"])
             with open(filename, "w", newline="") as f:
                 writer = csv.writer(f)
@@ -317,7 +320,7 @@ async def ws_run(asset_ids, labels: Dict[str, str]):
             print(f"Captured trades written to {filename}")
         captures = [c for c in captures if now_s < c["end_ts"]]
 
-    printer_task = asyncio.create_task(printer_loop(labels, state, lock))
+    printer_task = asyncio.create_task(printer_loop(labels, state, name, lock))
     async def capture_watcher():
         while True:
             await asyncio.sleep(1)
@@ -418,8 +421,8 @@ async def ws_run(asset_ids, labels: Dict[str, str]):
                                         trigger_ts = now_s
                                         new_capture = {
                                             "started_at": trigger_ts,
-                                            "start_ts": trigger_ts - LOOKBACK_SECONDS,
-                                            "end_ts": trigger_ts + LOOKBACK_SECONDS,
+                                            "start_ts": trigger_ts - CAPTURE_WINDOW_BEFORE_SECONDS,
+                                            "end_ts": trigger_ts + CAPTURE_WINDOW_AFTER_SECONDS,
                                             "trades": [],
                                         }
                                         append_past_trades(
@@ -463,14 +466,15 @@ async def ws_run(asset_ids, labels: Dict[str, str]):
 def main():
     load_dotenv(override=True)
 
-    leader_token = "81965132148053589449499920541031133901384216591712497808246133087025335332803"
-    lagger_token = "111160063407071262950390288172962217906459250371514775466225392390813944906959"
+    name = "manchester_y_draw_n"  # example market slug
+    leader_token = "14880253884429589143714410708277499114535878515321315661028077184935136600136"
+    lagger_token = "25289402866233407438323020633689007371776725536787458811786910674708413022028"
 
 
     labels = {"LEADER": leader_token, "LAGGER": lagger_token}
     asset_ids = list(labels.values())
 
-    asyncio.run(ws_run(asset_ids, labels))
+    asyncio.run(ws_run(asset_ids, labels, name))
 
 
 if __name__ == "__main__":

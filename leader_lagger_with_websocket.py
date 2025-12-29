@@ -4,9 +4,9 @@ Polymarket CLOB WebSocket Price Tracker (market channel)
 
 What it does (matches your REST tracker logic, but WS-fast):
 - Subscribes to the public market websocket for two token IDs (asset_ids)
-- Maintains ~60s rolling history per token of the last trade price
-- Prints: current last trade, ~1m_ago last trade, Δ1m in cents (if no trade in 1m, old=current)
-- Also tracks best_bid/best_ask and last_trade metadata when available
+- Maintains ~60s rolling history per token of mid prices when spreads are tight
+- Prints: current mid, ~1m_ago mid, Δ1m in cents (if no mid in 1m, old=current)
+- Tracks best_bid/best_ask; ignores last_trade events
 - Handles the important gotcha: the initial "book" snapshot may arrive as a LIST of events.
 
 Requirements:
@@ -27,7 +27,7 @@ from typing import Dict, Optional, Tuple, List
 
 import websockets
 from dotenv import load_dotenv
-from helpers import create_client, execute_trade_lagger
+from helpers import create_client, execute_trade_leader_lagger
 
 
 WSS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
@@ -37,12 +37,17 @@ TRADE_HISTORY_SECONDS = LOOKBACK_SECONDS * 2  # keep enough history to cover the
 PRINT_INTERVAL = 0.5        # how often to refresh the screen
 PING_INTERVAL = 10          # keepalive
 RECONNECT_MAX_BACKOFF = 30  # seconds
+CLEAR_INTERVAL = PRINT_INTERVAL  # keep one frame on screen at a time
 
 TRIGGER_AMOUNT = 0.1      # USD price move on leader to trigger capture
 TRADE_AMOUNT_USDC = 10.0    # notional USD amount to trade on lagger when triggered
-ORDER_MONITOR_TIMEOUT = 20  # seconds to wait before resuming price checks if not filled
-TRADE_COOLDOWN_SECONDS = LOOKBACK_SECONDS  # prevent repeated orders off same move window
+ORDER_MONITOR_TIMEOUT = 8  # seconds to wait before resuming price checks if not filled
+TRADE_COOLDOWN_SECONDS = 180  # prevent repeated orders off same move window
+TRADE_COOLDOWN_ON_ERROR = 30  # shorter cooldown when submission fails
+INITIAL_COOLDOWN_SECONDS = 5  # shorter warmup to avoid missing early moves
 STALE_OLD_SECONDS = 300  # only mark "old" as unavailable after 5 minutes without trades
+FRESH_PRICE_SECONDS = 30  # price update freshness required to trade
+MAX_SPREAD = 0.05  # max acceptable spread for mid-based logic
 
 def _now_s() -> int:
     return int(time.time())
@@ -66,7 +71,7 @@ def _to_float(x) -> Optional[float]:
 
 class TokenState:
     """
-    Keeps best bid/ask + last trade + rolling history of last trade prices (and best_ask for reference).
+    Keeps best bid/ask + rolling history of mid prices (and best_ask for reference).
     """
     def __init__(self, lookback_seconds: int = LOOKBACK_SECONDS):
         self.lookback_seconds = lookback_seconds
@@ -85,16 +90,31 @@ class TokenState:
         # Rolling history of BUY price proxy (best_ask): deque[(ts_s, best_ask)]
         self.ask_history: deque[Tuple[int, float]] = deque()
 
+        # Rolling history of mid prices when spread is tight enough: deque[(ts_s, mid)]
+        self.mid_history: deque[Tuple[int, float]] = deque()
+
         # When the last update arrived
         self.last_update_ts_s: Optional[int] = None
 
     def _trim(self, now_s: int):
         while self.ask_history and (now_s - self.ask_history[0][0] > self.lookback_seconds):
             self.ask_history.popleft()
+        while self.mid_history and (now_s - self.mid_history[0][0] > self.lookback_seconds):
+            self.mid_history.popleft()
 
     def _record_best_ask(self, ts_s: int, best_ask: float):
         self.best_ask = best_ask
         self.ask_history.append((ts_s, best_ask))
+        self._trim(ts_s)
+
+    def _record_mid(self, ts_s: int, bb: Optional[float], ba: Optional[float]):
+        if bb is None or ba is None:
+            return
+        spread = ba - bb
+        if spread < 0 or spread > MAX_SPREAD:
+            return
+        mid = (bb + ba) / 2.0
+        self.mid_history.append((ts_s, mid))
         self._trim(ts_s)
 
     def _trim_trades(self, now_s: int):
@@ -127,11 +147,9 @@ class TokenState:
             # only append if changed to reduce noise
             if self.best_ask is None or abs(ba - self.best_ask) > 1e-12:
                 self._record_best_ask(ts_s, ba)
+        self._record_mid(ts_s, self.best_bid, self.best_ask)
 
-        # Some book snapshots include last_trade_price (as seen in your output)
-        ltp = _to_float(last_trade_price)
-        if ltp is not None:
-            return self._record_trade(ts_s, ltp, None, None)
+        # Ignore last_trade_price for mid-based strategy
         return None
 
     def update_from_price_change(self, ts_s: int, best_bid, best_ask):
@@ -148,6 +166,7 @@ class TokenState:
         if ba is not None:
             if self.best_ask is None or abs(ba - self.best_ask) > 1e-12:
                 self._record_best_ask(ts_s, ba)
+        self._record_mid(ts_s, self.best_bid, self.best_ask)
 
     def update_from_last_trade(self, ts_s: int, price, side, size):
         self.last_update_ts_s = ts_s
@@ -205,6 +224,30 @@ class TokenState:
                 break
         return cur_price, old
 
+    def get_current_and_old_mid(self) -> Tuple[Optional[float], Optional[float]]:
+        """
+        Returns (current_mid, mid_1m_ago) using only periods where spread <= MAX_SPREAD.
+        """
+        now_s = _now_s()
+        self._trim(now_s)
+
+        if not self.mid_history:
+            return None, None
+
+        cur_ts_s, cur_mid = self.mid_history[-1]
+
+        # Require the current mid to be fresh enough; otherwise skip.
+        if now_s - cur_ts_s > STALE_OLD_SECONDS:
+            return None, None
+
+        old = cur_mid
+        for ts_s, mid in self.mid_history:
+            if now_s - ts_s >= self.lookback_seconds:
+                old = mid
+            else:
+                break
+        return cur_mid, old
+
     def get_recent_trades(self, since_ts: int, until_ts: int) -> List[Tuple[int, float, Optional[float]]]:
         """
         Returns trades between since_ts and until_ts (inclusive).
@@ -221,10 +264,18 @@ async def ping_loop(ws: websockets.WebSocketClientProtocol, interval: int = PING
         await asyncio.sleep(interval)
 
 
-async def printer_loop(labels: Dict[str, str], state: Dict[str, TokenState], lock: asyncio.Lock, order_state: Dict[str, str]):
+async def printer_loop(labels: Dict[str, str], state: Dict[str, TokenState], lock: asyncio.Lock, order_state: Dict[str, str], name: str):
+    last_clear = 0
     while True:
-        os.system("clear" if os.name == "posix" else "cls")
-        print("--- WS Price Tracker (last trade as current price) ---")
+        now = time.time()
+        if now - last_clear >= CLEAR_INTERVAL:
+            if os.name == "posix":
+                # Faster than spawning a shell process each frame.
+                print("\033[2J\033[H", end="")
+            else:
+                os.system("cls")
+            last_clear = now
+        print(f"--- WS Price Tracker: {name} ---")
         print(f"WS: {WSS_URL}")
         print(f"Lookback: {LOOKBACK_SECONDS}s | Print: {PRINT_INTERVAL}s")
         print()
@@ -250,29 +301,19 @@ async def printer_loop(labels: Dict[str, str], state: Dict[str, TokenState], loc
                     spread = st.best_ask - st.best_bid
                 spread_str = f"{spread:.4f}" if spread is not None else "—"
 
-                cur, old = st.get_current_and_old_trade()
+                cur, old = st.get_current_and_old_mid()
                 bb, ba = st.best_bid, st.best_ask
 
                 if cur is None or old is None:
-                    print(
-                        f"{label}: cur={cur} old={old} | best_bid={bb} best_ask={ba} | spread={spread_str}"
-                    )
+                    print(f"{label}: mid_cur={cur} mid_old={old} | best_bid={bb} best_ask={ba} | spread={spread_str}")
                     continue
 
                 delta_cents = (cur - old) * 100.0
 
-                trade_str = ""
-                if st.last_trade_price is not None and st.last_trade_ts_s is not None:
-                    trade_age = _now_s() - st.last_trade_ts_s
-                    side = st.last_trade_side or "?"
-                    size_str = f"${st.last_trade_size:.2f}" if st.last_trade_size is not None else "?"
-                    trade_str = f" | last_trade={st.last_trade_price:.4f} ({side}, notional={size_str}, age={trade_age}s)"
-
                 print(
-                    f"{label}: current={cur:.4f} | 1m_ago={old:.4f} | Δ1m={delta_cents:+.2f}¢"
+                    f"{label}: mid_cur={cur:.4f} | mid_1m_ago={old:.4f} | Δ1m={delta_cents:+.2f}¢"
                     f" | best_bid={bb if bb is not None else '—'} best_ask={ba if ba is not None else '—'}"
                     f" | spread={spread_str}"
-                    f"{trade_str}"
                 )
 
         await asyncio.sleep(PRINT_INTERVAL)
@@ -282,28 +323,36 @@ def _ts_to_iso(ts_s: int) -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts_s))
 
 
-async def ws_run(asset_ids, labels: Dict[str, str], client):
+async def ws_run(asset_ids, labels: Dict[str, str], client, name: str):
     # shared state
     state: Dict[str, TokenState] = {aid: TokenState(LOOKBACK_SECONDS) for aid in asset_ids}
     lock = asyncio.Lock()
-    order_state: Dict[str, str] = {"active": False, "last_status": "", "cooldown_until": 0}
+    initial_cooldown_until = _now_s() + INITIAL_COOLDOWN_SECONDS
+    order_state: Dict[str, str] = {
+        "active": False,
+        "last_status": "",
+        "cooldown_until": initial_cooldown_until,
+    }
 
     leader_aid = labels.get("LEADER")
     lagger_aid = labels.get("LAGGER")
     if not leader_aid or not lagger_aid:
         raise ValueError("Both LEADER and LAGGER token ids are required.")
 
-    async def run_lagger_trade(lagger_reference_price: float):
+    async def run_lagger_trade(lagger_old: float, leader_move: float, cur_lagger_price: Optional[float] = None):
         loop = asyncio.get_running_loop()
         try:
             status, filled = await loop.run_in_executor(
                 None,
-                lambda: execute_trade_lagger(
+                lambda: execute_trade_leader_lagger(
                     client,
                     lagger_aid,
-                    lagger_reference_price,
-                    TRIGGER_AMOUNT,
+                    lagger_old,
                     TRADE_AMOUNT_USDC,
+                    cur_lagger_price,
+                    TRIGGER_AMOUNT,
+                    state[lagger_aid].best_ask,
+                    leader_move,
                     monitor_timeout=ORDER_MONITOR_TIMEOUT,
                 ),
             )
@@ -313,9 +362,11 @@ async def ws_run(asset_ids, labels: Dict[str, str], client):
         async with lock:
             order_state["active"] = False
             order_state["last_status"] = status or "timeout"
+            cooldown = TRADE_COOLDOWN_SECONDS if status in ("filled", "closed", "matched") else TRADE_COOLDOWN_ON_ERROR
+            order_state["cooldown_until"] = _now_s() + cooldown
         return status, filled
 
-    printer_task = asyncio.create_task(printer_loop(labels, state, lock, order_state))
+    printer_task = asyncio.create_task(printer_loop(labels, state, lock, order_state, name))
     current_order_task: Optional[asyncio.Task] = None
     def _on_order_done(task: asyncio.Task):
         nonlocal current_order_task
@@ -342,6 +393,7 @@ async def ws_run(asset_ids, labels: Dict[str, str], client):
 
                     backoff = 1
                     async for raw in ws:
+                        trigger_params: Optional[Tuple[float, float, Optional[float]]] = None
                         try:
                             data = json.loads(raw)
                         except Exception:
@@ -365,7 +417,7 @@ async def ws_run(asset_ids, labels: Dict[str, str], client):
                                         continue
                                     bids = msg.get("bids") or msg.get("buys") or []
                                     asks = msg.get("asks") or msg.get("sells") or []
-                                    rec = state[aid].update_from_book(
+                                    state[aid].update_from_book(
                                         ts_s,
                                         bids=bids,
                                         asks=asks,
@@ -387,42 +439,44 @@ async def ws_run(asset_ids, labels: Dict[str, str], client):
                                         )
 
                                 elif et == "last_trade_price":
-                                    aid = msg.get("asset_id")
-                                    if aid not in state:
-                                        continue
-                                    state[aid].update_from_last_trade(
-                                        ts_s,
-                                        price=msg.get("price"),
-                                        side=msg.get("side"),
-                                        size=msg.get("size"),
-                                    )
+                                    # Ignore last-trade updates for signal logic; we operate on mid prices only.
+                                    continue
 
                                 else:
                                     # tick_size_change or unknown event types: ignore
                                     pass
 
-                            cur, old = state[leader_aid].get_current_and_old_trade()
+                            cur, old = state[leader_aid].get_current_and_old_mid()
                             now_s = _now_s()
+                            leader_fresh = state[leader_aid].last_update_ts_s and (now_s - state[leader_aid].last_update_ts_s) <= FRESH_PRICE_SECONDS
+                            lagger_fresh = state[lagger_aid].last_update_ts_s and (now_s - state[lagger_aid].last_update_ts_s) <= FRESH_PRICE_SECONDS
+                            lagger_spread_ok = (
+                                state[lagger_aid].best_bid is not None
+                                and state[lagger_aid].best_ask is not None
+                                and (state[lagger_aid].best_ask - state[lagger_aid].best_bid) <= MAX_SPREAD
+                            )
+                            leader_move = (cur - old) if (cur is not None and old is not None) else None
                             if (
                                 (not order_state["active"])
                                 and now_s >= order_state.get("cooldown_until", 0)
                                 and cur is not None
                                 and old is not None
-                                and (cur - old) > TRIGGER_AMOUNT
+                                and leader_move is not None
+                                and leader_move > TRIGGER_AMOUNT
+                                and leader_fresh
+                                and lagger_fresh
+                                and lagger_spread_ok
                             ):
-                                lagger_cur, lagger_old = state[lagger_aid].get_current_and_old_trade()
-                                lagger_reference_price = lagger_old or lagger_cur
-                                if lagger_reference_price is not None:
+                                lagger_cur, lagger_old = state[lagger_aid].get_current_and_old_mid()
+                                if ((lagger_old is not None) and (lagger_cur is not None) and (lagger_cur < (lagger_old + 0.05))):
                                     order_state["active"] = True
                                     order_state["last_status"] = "submitting"
-                                    order_state["cooldown_until"] = now_s + TRADE_COOLDOWN_SECONDS
-                                    current_order_task = asyncio.create_task(run_lagger_trade(lagger_reference_price))
-                                    current_order_task.add_done_callback(_on_order_done)
-                                    #get random number between 1000 and 5000
-                                    random_number = random.randint(1000, 5000)
-                                    #save a timestap to a txt file
-                                    with open(f"last_trade_timestamp_{random_number}.txt", "w") as f:
-                                        f.write(_ts_to_iso(now_s))
+                                    order_state["cooldown_until"] = now_s  # prevent duplicate triggers before task launches
+                                    trigger_params = (lagger_old, leader_move, lagger_cur)
+
+                        if trigger_params and current_order_task is None:
+                            current_order_task = asyncio.create_task(run_lagger_trade(*trigger_params))
+                            current_order_task.add_done_callback(_on_order_done)
 
                     # socket ended
                     pinger.cancel()
@@ -445,14 +499,15 @@ def main():
     load_dotenv(override=True)
     client = create_client()
 
-    leader_token = "89884975119324541734023674040273698067050774915985018635745294568292670695924"
-    lagger_token = "43444484953307067497949002485007513712813674952491389537324272931320530568295"
+    name = "coventry_win_lagger"  # example market slug
+    leader_token = "78266939609943433944729517447155304338489140276667989075175305964619529651042"
+    lagger_token = "41226763440217491120537856178503536027112518659021932552472810936480025487547"
 
 
     labels = {"LEADER": leader_token, "LAGGER": lagger_token}
     asset_ids = list(labels.values())
 
-    asyncio.run(ws_run(asset_ids, labels, client))
+    asyncio.run(ws_run(asset_ids, labels, client, name))
 
 
 if __name__ == "__main__":

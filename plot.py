@@ -161,10 +161,10 @@ def plot_lag_data(filename: str, api_1=None, api_2=None, api_3=None):
 
 if __name__ == "__main__":
     # Run: python plotter.py  (or edit filename below)
-    file_to_plot = "capture_1766755277.846453_zimb.csv"
+    file_to_plot = "capture_1766784206.088295_zam_y_draw_n.csv"
 
     # Optional manual API timestamps (string/datetime). Leave as None to skip.
-    api_1 = "2025-12-26T13:21:11.000"  # e.g., "2025-01-24T12:34:56.123Z"
+    api_1 = None  # e.g., "2025-01-24T12:34:56.123Z"
     api_2 = None
     api_3 = None
 

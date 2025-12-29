@@ -1,0 +1,6 @@
+matplotlib
+pandas
+py_clob_client
+python-dotenv
+requests
+websockets

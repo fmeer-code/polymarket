@@ -1,0 +1,4 @@
+# activte env on server
+
+python3 -m venv /root/venv
+source /root/venv/bin/activate

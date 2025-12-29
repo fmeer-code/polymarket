@@ -197,23 +197,7 @@ def monitor_order(client, order_id, original_size, timeout=180):
     last_filled = 0.0
 
     while time.time() < deadline:
-        order_info = None
-
-        try:
-            if hasattr(client, "get_order"):
-                order_info = client.get_order(order_id)
-            elif hasattr(client, "get_order_status"):
-                order_info = client.get_order_status(order_id)
-        except Exception:
-            order_info = None
-
-        if order_info is None:
-            try:
-                resp = requests.get(f"https://clob.polymarket.com/orders/{order_id}", timeout=10)
-                if resp.ok:
-                    order_info = resp.json()
-            except Exception:
-                order_info = None
+        order_info = _fetch_order_info(client, order_id)
 
         if not order_info:
             time.sleep(1)
@@ -233,13 +217,71 @@ def monitor_order(client, order_id, original_size, timeout=180):
 
     return last_status, last_filled
 
-def cancel_order(client, order_id):
+def _fetch_order_info(client, order_id):
+    """Retrieve order info from client or REST fallback."""
     try:
-        if hasattr(client, "cancel_order"):
-            client.cancel_order(order_id)
-            return True
+        if hasattr(client, "get_order"):
+            return client.get_order(order_id)
+        if hasattr(client, "get_order_status"):
+            return client.get_order_status(order_id)
     except Exception:
+        pass
+
+    try:
+        resp = requests.get(f"https://clob.polymarket.com/orders/{order_id}", timeout=10)
+        if resp.ok:
+            return resp.json()
+    except Exception:
+        pass
+    return None
+
+def cancel_order(client, order_id, confirm_timeout=15):
+    """Send a cancel request and confirm the order actually closed."""
+    cancel_fn = None
+    for attr in ("cancel_order", "post_cancel_order", "cancel"):
+        fn = getattr(client, attr, None)
+        if callable(fn):
+            cancel_fn = fn
+            break
+
+    if not cancel_fn:
+        print("Client does not expose a cancel method.")
         return False
+
+    try:
+        resp = cancel_fn(order_id)
+    except PolyApiException as exc:
+        print(f"Cancel request failed: {_format_poly_exception(exc)}")
+        return False
+    except Exception as exc:
+        print(f"Cancel request failed: {type(exc).__name__}: {exc}")
+        return False
+
+    # If response explicitly signals failure, bail early
+    if isinstance(resp, dict):
+        status_text = str(resp.get("status") or resp.get("message") or "").lower()
+        if resp.get("success") is False or "error" in status_text:
+            print(f"Cancel request rejected: {resp}")
+            return False
+
+    deadline = time.time() + confirm_timeout
+    last_status = None
+
+    while time.time() < deadline:
+        order_info = _fetch_order_info(client, order_id)
+        if order_info:
+            last_status, _, _ = parse_order_info(order_info, original_size=0)
+            if last_status in ("cancelled", "canceled", "expired"):
+                return True
+            if last_status in ("filled", "closed", "matched"):
+                print("Order filled before cancellation could take effect.")
+                return False
+        time.sleep(1)
+
+    if last_status:
+        print(f"Cancel not confirmed after {confirm_timeout}s; last status: {last_status}.")
+    else:
+        print(f"Cancel not confirmed after {confirm_timeout}s; no order info available.")
     return False
 
 def cash_out(client, token_id, filled_shares, tracker=None):
@@ -318,7 +360,7 @@ def execute_trade(client, token_id, tracker, TRADE_AMOUNT_USDC):
     # Calculate shares: (Amount / Price)
     shares = round(TRADE_AMOUNT_USDC / limit_price, 2)
 
-    print(f"Placing Limit Order: {shares} shares at ${limit_price} (token {token_id}) based on lagger price {lagger_price_1m_ago:.4f}...")
+    print(f"Placing Limit Order: {shares} shares at ${limit_price} (token {token_id}) ...")
     
     order_args = OrderArgs(
         price=limit_price,
@@ -346,20 +388,99 @@ def execute_trade(client, token_id, tracker, TRADE_AMOUNT_USDC):
     else:
         print(f"Order monitoring ended without fill. Last status: {status or 'unknown'}.")
 
-def execute_trade_lagger(client, token_id, lagger_price_1m_ago, trigger_amount, TRADE_AMOUNT_USDC, monitor_timeout=20):
+def execute_trade_leader_leader(client, token_id, lagger_price_1m_ago, TRADE_AMOUNT_USDC, monitor_timeout=20):
     status = "error"
     filled = 0.0
-
     # Set limit price 5 cents over market (Aggressive Fill)
-    limit_price = round(lagger_price_1m_ago + trigger_amount, 2)
-    if limit_price > 0.9:
-        print("Limit price capped at $0.90.")
-        return "skipped_limit", filled
+    limit_price = round(lagger_price_1m_ago + (1 - lagger_price_1m_ago) / 4, 2)
+    if limit_price > 0.94:
+        limit_price = 0.94
+        #print("Limit price capped at $0.94.")
+        #return "skipped_limit", filled
     
     # Calculate shares: (Amount / Price)
     shares = round(TRADE_AMOUNT_USDC / limit_price, 2)
 
     print(f"Placing Limit Order: {shares} shares at ${limit_price}...")
+    
+    order_args = OrderArgs(
+        price=limit_price,
+        size=shares,
+        side=BUY,
+        token_id=token_id
+    )
+    
+    try:
+        signed_order = client.create_order(order_args)
+        resp = client.post_order(signed_order, OrderType.GTC)
+        order_id = extract_order_id(resp)
+        if not order_id:
+            print("Order submission failed: no order id returned.")
+            return "no_order_id", filled
+        print(f"Order submitted (id: {order_id})")
+    except PolyApiException as exc:
+        detail = _format_poly_exception(exc)
+        status = f"submit_error: {detail}"
+        if "balance" in detail.lower():
+            status = "insufficient_balance"
+        elif "allowance" in detail.lower() or "approval" in detail.lower():
+            status = "allowance_needed"
+        print(f"Lagger order failed: {detail}")
+        return status, filled
+    except Exception as exc:
+        print(f"Lagger order failed: {type(exc).__name__}: {exc}")
+        return "submit_error", filled
+
+    status, filled = monitor_order(client, order_id, shares, timeout=monitor_timeout)
+    fully_filled = filled >= shares
+
+    if status in ("filled", "closed", "matched") and fully_filled:
+        print(f"Order filled ({filled} shares).")
+    else:
+        # Cancel if anything remains unfilled after the monitor timeout
+        if status in ("filled", "closed", "matched"):
+            print(f"Order reported filled but only {filled}/{shares} filled; cancelling remainder.")
+        elif status in ("cancelled", "expired"):
+            print(f"Order {status}. Filled {filled} shares.")
+            return status, filled
+        else:
+            print(f"Order monitoring ended without full fill. Last status: {status or 'unknown'}. Filled {filled} shares.")
+
+        if cancel_order(client, order_id):
+            print("Order cancelled after timeout.")
+            status = "cancelled"
+        else:
+            print("Order cancel attempt failed or not supported.")
+
+    return status, filled
+
+def execute_trade_leader_lagger(
+    client,
+    token_id,
+    lagger_price_1m_ago,
+    TRADE_AMOUNT_USDC,
+    cur_lagger_price,
+    trigger_amount,
+    lagger_best_ask,
+    leader_move,
+    monitor_timeout=20,
+):
+    status = "error"
+    filled = 0.0
+    # Anchor limit to current lagger best ask with a fraction of leader move to avoid overpaying on thin books.
+    if lagger_best_ask is None:
+        print("Skipping trade: lagger best ask unavailable.")
+        return "no_best_ask", filled
+
+    leader_move = max(0.0, leader_move or 0.0)
+    price_bump = max(0.01, min(leader_move * 0.5, trigger_amount))
+    raw_limit = lagger_best_ask + price_bump
+    limit_price = round(min(0.94, raw_limit), 2)
+    
+    # Calculate shares: (Amount / Price)
+    shares = round(TRADE_AMOUNT_USDC / limit_price, 2)
+
+    print(f"Placing Limit Order: {shares} shares at ${limit_price}... original lagger price 1m ago: {lagger_price_1m_ago:.4f}")
     
     order_args = OrderArgs(
         price=limit_price,
@@ -390,52 +511,24 @@ def execute_trade_lagger(client, token_id, lagger_price_1m_ago, trigger_amount, 
         return "submit_error", filled
 
     status, filled = monitor_order(client, order_id, shares, timeout=monitor_timeout)
-    if status in ("filled", "closed", "matched"):
+    fully_filled = filled >= shares
+
+    if status in ("filled", "closed", "matched") and fully_filled:
         print(f"Order filled ({filled} shares).")
-    elif status in ("cancelled", "expired"):
-        print(f"Order {status}. Filled {filled} shares.")
     else:
-        print(f"Order monitoring ended without fill. Last status: {status or 'unknown'}.")
+        # Cancel if anything remains unfilled after the monitor timeout
+        if status in ("filled", "closed", "matched"):
+            print(f"Order reported filled but only {filled}/{shares} filled; cancelling remainder.")
+        elif status in ("cancelled", "expired"):
+            print(f"Order {status}. Filled {filled} shares.")
+            return status, filled
+        else:
+            print(f"Order monitoring ended without full fill. Last status: {status or 'unknown'}. Filled {filled} shares.")
+
         if cancel_order(client, order_id):
-            print("Unfilled order cancelled after timeout.")
+            print("Order cancelled after timeout.")
             status = "cancelled"
         else:
             print("Order cancel attempt failed or not supported.")
+
     return status, filled
-
-def cash_out_lagger(client, token_id, filled_shares,limit_price):
-    """Submit a simple limit-sell to exit the filled position."""
-    if filled_shares <= 0:
-        print("No filled size to cash out.")
-        return
-
-    order_args = OrderArgs(
-        price=limit_price,
-        size=filled_shares,
-        side=SELL,
-        token_id=token_id
-    )
-
-    try:
-        signed_order = client.create_order(order_args)
-        resp = client.post_order(signed_order, OrderType.GTC)
-        order_id = extract_order_id(resp)
-        if not order_id:
-            print("Cash-out submission failed (no order id).")
-            return
-        print(f"Cash-out submitted (id: {order_id})")
-        status, filled = monitor_order(client, order_id, filled_shares, timeout=120)
-        if status in ("filled", "closed", "matched"):
-            print(f"Cash-out filled ({filled} shares).")
-        elif status in ("cancelled", "expired"):
-            print(f"Cash-out {status}. Filled {filled} shares.")
-        else:
-            print(f"Cash-out monitoring ended without fill. Last status: {status or 'unknown'}.")
-    except PolyApiException as exc:
-        msg = str(getattr(exc, "error_message", "")) or str(exc)
-        if "not enough balance" in msg.lower():
-            print("Cash-out skipped: no balance/allowance (likely already sold).")
-        else:
-            print(f"Cash-out order failed: {msg}")
-    except Exception as exc:
-        print(f"Cash-out order failed: {exc}")

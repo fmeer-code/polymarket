@@ -13,7 +13,7 @@ if not api_key:
     raise ValueError("SPORTRADAR_API_KEY must be set in the environment")
 
 # sport_event_id can be passed as CLI arg or pulled from env SPORT_EVENT_ID
-sport_event_id = "sr:sport_event:57797073"
+sport_event_id = "sr:sport_event:57797071"
 GOAL_LOG_PATH = "goal_events.txt"
 
 headers = {"x-api-key": api_key}
@@ -26,20 +26,6 @@ params = {
 
 def _iso_millis(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).isoformat(timespec="milliseconds")
-
-
-def _timestamp_with_millis(raw_timestamp: str | None) -> str:
-    """Normalize a raw timestamp to UTC ISO format with millisecond precision."""
-    if not raw_timestamp:
-        return _iso_millis(datetime.now(timezone.utc))
-
-    try:
-        normalized = raw_timestamp.replace("Z", "+00:00")
-        parsed = datetime.fromisoformat(normalized)
-    except ValueError:
-        return raw_timestamp
-
-    return _iso_millis(parsed)
 
 
 def _event_exists(event_id: str) -> bool:
@@ -135,9 +121,7 @@ for line in stream_resp.iter_lines():
             if not scorer:
                 continue
 
-            event_time = _timestamp_with_millis(
-                event_payload.get("updated_time") or event_payload.get("time")
-            )
+            event_time = _iso_millis(datetime.now(timezone.utc))
 
             print(f"{event_time} {scorer}")
             with open(GOAL_LOG_PATH, "a", encoding="utf-8") as log_file:
