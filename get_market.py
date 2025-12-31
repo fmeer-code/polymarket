@@ -85,26 +85,35 @@ def format_market_tokens(markets):
     return formatted
 
 
-def get_tokens_for_market(slug):
+def get_tokens_for_market(slug, raw=False):
+    """
+    Returns token ids for a market slug.
+
+    By default this returns a dict mapping each outcome bucket (home/away/draw)
+    to its yes/no token ids, e.g.:
+      {"home-yes": "...", "home-no": "...", "draw-yes": "...", "draw-no": "...", ...}
+
+    Passing raw=True returns the raw list of markets with question/outcomes/tokenIds.
+    """
     market_info = get_market_by_slug(slug)
-
-    if market_info:
-        trimmed = extract_questions_outcomes_token_ids(market_info)
-        print("Raw markets:")
-        print(json.dumps(trimmed, indent=4))
-
-        formatted_tokens = format_market_tokens(trimmed)
-        #print("\nFormatted tokens:")
-        #print(json.dumps(formatted_tokens, indent=4))
-    else:
+    if not market_info:
         print(f"Could not retrieve market for slug: {slug}")
         return None
-    
-    return formatted_tokens
+
+    trimmed = extract_questions_outcomes_token_ids(market_info)
+    if raw:
+        return trimmed
+
+    return format_market_tokens(trimmed)
 
 
 if __name__ == "__main__":
     # Example usage
     example_slug = "elc-cov-ips-2025-12-29"
-    tokens = get_tokens_for_market(example_slug)
-    print(tokens)
+    raw_markets = get_tokens_for_market(example_slug, raw=True)
+    print("Raw markets:")
+    print(raw_markets)
+
+    formatted = get_tokens_for_market(example_slug)
+    print("\nFormatted tokens:")
+    print(json.dumps(formatted, indent=4))

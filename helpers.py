@@ -459,29 +459,23 @@ def execute_trade_leader_lagger(
     token_id,
     lagger_price_1m_ago,
     TRADE_AMOUNT_USDC,
-    cur_lagger_price,
     trigger_amount,
-    lagger_best_ask,
+    leader_old,
     leader_move,
     monitor_timeout=20,
 ):
     status = "error"
     filled = 0.0
-    # Anchor limit to current lagger best ask with a fraction of leader move to avoid overpaying on thin books.
-    if lagger_best_ask is None:
-        print("Skipping trade: lagger best ask unavailable.")
-        return "no_best_ask", filled
 
-    leader_move = max(0.0, leader_move or 0.0)
-    price_bump = max(0.01, min(leader_move * 0.5, trigger_amount))
-    raw_limit = lagger_best_ask + price_bump
-    limit_price = round(min(0.94, raw_limit), 2)
+    # same headroom fraction as leader’s move
+    ratio = leader_move / max(1e-6, (1 - leader_old))
+    raw_limit = lagger_price_1m_ago + ratio * (1 - lagger_price_1m_ago)
+    limit_price = round(min(0.96, raw_limit), 2)
+
     
     # Calculate shares: (Amount / Price)
     shares = round(TRADE_AMOUNT_USDC / limit_price, 2)
 
-    print(f"Placing Limit Order: {shares} shares at ${limit_price}... original lagger price 1m ago: {lagger_price_1m_ago:.4f}")
-    
     order_args = OrderArgs(
         price=limit_price,
         size=shares,

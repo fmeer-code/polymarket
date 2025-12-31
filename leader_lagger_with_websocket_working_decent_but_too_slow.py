@@ -282,44 +282,41 @@ async def printer_loop(labels: Dict[str, str], state: Dict[str, TokenState], loc
         print(f"Lookback: {LOOKBACK_SECONDS}s | Print: {PRINT_INTERVAL}s")
         print()
 
-        # Copy a lightweight snapshot while holding the lock briefly, then print outside the lock
-        snapshot = []
         async with lock:
-            order_copy = dict(order_state)
+            if order_state.get("active"):
+                print("Order: active (monitoring lagger order, price updates paused)")
+            elif order_state.get("last_status"):
+                last_status = order_state["last_status"]
+                if last_status == "skipped_limit":
+                    print("Order: limit_price capped at $0.90")
+                else:
+                    print(f"Order: last status = {last_status}")
+
             for label, asset_id in labels.items():
                 st = state.get(asset_id)
                 if not st:
-                    snapshot.append((label, None, None, None, None, None))
+                    print(f"{label}: no state")
                     continue
 
                 spread = None
                 if st.best_bid is not None and st.best_ask is not None:
                     spread = st.best_ask - st.best_bid
+                spread_str = f"{spread:.4f}" if spread is not None else "—"
+
                 cur, old = st.get_current_and_old_mid()
-                snapshot.append((label, cur, old, st.best_bid, st.best_ask, spread))
+                bb, ba = st.best_bid, st.best_ask
 
-        if order_copy.get("active"):
-            print("Order: active (monitoring lagger order, price updates paused)")
-        elif order_copy.get("last_status"):
-            last_status = order_copy["last_status"]
-            if last_status == "skipped_limit":
-                print("Order: limit_price capped at $0.90")
-            else:
-                print(f"Order: last status = {last_status}")
+                if cur is None or old is None:
+                    print(f"{label}: mid_cur={cur} mid_old={old} | best_bid={bb} best_ask={ba} | spread={spread_str}")
+                    continue
 
-        for label, cur, old, bb, ba, spread in snapshot:
-            spread_str = f"{spread:.4f}" if spread is not None else "—"
-            if cur is None or old is None:
-                print(f"{label}: mid_cur={cur} mid_old={old} | best_bid={bb} best_ask={ba} | spread={spread_str}")
-                continue
+                delta_cents = (cur - old) * 100.0
 
-            delta_cents = (cur - old) * 100.0
-
-            print(
-                f"{label}: mid_cur={cur:.4f} | mid_1m_ago={old:.4f} | Δ1m={delta_cents:+.2f}¢"
-                f" | best_bid={bb if bb is not None else '—'} best_ask={ba if ba is not None else '—'}"
-                f" | spread={spread_str}"
-            )
+                print(
+                    f"{label}: mid_cur={cur:.4f} | mid_1m_ago={old:.4f} | Δ1m={delta_cents:+.2f}¢"
+                    f" | best_bid={bb if bb is not None else '—'} best_ask={ba if ba is not None else '—'}"
+                    f" | spread={spread_str}"
+                )
 
         await asyncio.sleep(PRINT_INTERVAL)
 
@@ -344,13 +341,7 @@ async def ws_run(asset_ids, labels: Dict[str, str], client, name: str):
     if not leader_aid or not lagger_aid:
         raise ValueError("Both LEADER and LAGGER token ids are required.")
 
-    async def run_lagger_trade(
-        lagger_old: float,
-        leader_old: float,
-        cur_lagger_price: Optional[float] = None,
-        lagger_best_ask: Optional[float] = None,
-        leader_move: Optional[float] = None,
-    ):
+    async def run_lagger_trade(lagger_old: float, leader_move: float, cur_lagger_price: Optional[float] = None):
         loop = asyncio.get_running_loop()
         try:
             status, filled = await loop.run_in_executor(
@@ -360,8 +351,9 @@ async def ws_run(asset_ids, labels: Dict[str, str], client, name: str):
                     lagger_aid,
                     lagger_old,
                     TRADE_AMOUNT_USDC,
+                    cur_lagger_price,
                     TRIGGER_AMOUNT,
-                    leader_old,
+                    state[lagger_aid].best_ask,
                     leader_move,
                     monitor_timeout=ORDER_MONITOR_TIMEOUT,
                 ),
@@ -403,7 +395,7 @@ async def ws_run(asset_ids, labels: Dict[str, str], client, name: str):
 
                     backoff = 1
                     async for raw in ws:
-                        trigger_params: Optional[Tuple[float, float, Optional[float], Optional[float], Optional[float]]] = None
+                        trigger_params: Optional[Tuple[float, float, Optional[float]]] = None
                         try:
                             data = json.loads(raw)
                         except Exception:
@@ -413,7 +405,6 @@ async def ws_run(asset_ids, labels: Dict[str, str], client, name: str):
                         # sometimes Polymarket sends a LIST of events (your initial book snapshot was a list)
                         events = data if isinstance(data, list) else [data]
 
-                        # Minimal critical section: mutate shared state and take a tiny snapshot for trigger eval
                         async with lock:
                             for msg in events:
                                 if not isinstance(msg, dict):
@@ -457,42 +448,33 @@ async def ws_run(asset_ids, labels: Dict[str, str], client, name: str):
                                     # tick_size_change or unknown event types: ignore
                                     pass
 
-                            leader_cur, leader_old = state[leader_aid].get_current_and_old_mid()
-                            lagger_cur, lagger_old = state[lagger_aid].get_current_and_old_mid()
-                            leader_last_ts = state[leader_aid].last_update_ts_s
-                            lagger_last_ts = state[lagger_aid].last_update_ts_s
-                            lagger_bb, lagger_ba = state[lagger_aid].best_bid, state[lagger_aid].best_ask
-                            order_active = order_state["active"]
-                            cooldown_until = order_state.get("cooldown_until", 0)
-
-                        now_s = _now_s()
-                        leader_fresh = leader_last_ts and (now_s - leader_last_ts) <= FRESH_PRICE_SECONDS
-                        lagger_fresh = lagger_last_ts and (now_s - lagger_last_ts) <= FRESH_PRICE_SECONDS
-                        lagger_spread_ok = (
-                            lagger_bb is not None
-                            and lagger_ba is not None
-                            and (lagger_ba - lagger_bb) <= MAX_SPREAD
-                        )
-                        leader_move = (leader_cur - leader_old) if (leader_cur is not None and leader_old is not None) else None
-                        trigger_ready = (
-                            (not order_active)
-                            and now_s >= cooldown_until
-                            and leader_cur is not None
-                            and leader_old is not None
-                            and leader_move is not None
-                            and leader_move > TRIGGER_AMOUNT
-                            and leader_fresh
-                            and lagger_fresh
-                            and lagger_spread_ok
-                        )
-                        if trigger_ready:
-                            if (lagger_old is not None) and (lagger_cur is not None):
-                                async with lock:
-                                    if (not order_state["active"]) and _now_s() >= order_state.get("cooldown_until", 0):
-                                        order_state["active"] = True
-                                        order_state["last_status"] = "submitting"
-                                        order_state["cooldown_until"] = _now_s()  # prevent duplicate triggers before task launches
-                                        trigger_params = (lagger_old, leader_old, lagger_cur, lagger_ba, leader_move)
+                            cur, old = state[leader_aid].get_current_and_old_mid()
+                            now_s = _now_s()
+                            leader_fresh = state[leader_aid].last_update_ts_s and (now_s - state[leader_aid].last_update_ts_s) <= FRESH_PRICE_SECONDS
+                            lagger_fresh = state[lagger_aid].last_update_ts_s and (now_s - state[lagger_aid].last_update_ts_s) <= FRESH_PRICE_SECONDS
+                            lagger_spread_ok = (
+                                state[lagger_aid].best_bid is not None
+                                and state[lagger_aid].best_ask is not None
+                                and (state[lagger_aid].best_ask - state[lagger_aid].best_bid) <= MAX_SPREAD
+                            )
+                            leader_move = (cur - old) if (cur is not None and old is not None) else None
+                            if (
+                                (not order_state["active"])
+                                and now_s >= order_state.get("cooldown_until", 0)
+                                and cur is not None
+                                and old is not None
+                                and leader_move is not None
+                                and leader_move > TRIGGER_AMOUNT
+                                and leader_fresh
+                                and lagger_fresh
+                                and lagger_spread_ok
+                            ):
+                                lagger_cur, lagger_old = state[lagger_aid].get_current_and_old_mid()
+                                if ((lagger_old is not None) and (lagger_cur is not None) and (lagger_cur < (lagger_old + 0.1))):
+                                    order_state["active"] = True
+                                    order_state["last_status"] = "submitting"
+                                    order_state["cooldown_until"] = now_s  # prevent duplicate triggers before task launches
+                                    trigger_params = (lagger_old, leader_move, lagger_cur)
 
                         if trigger_params and current_order_task is None:
                             current_order_task = asyncio.create_task(run_lagger_trade(*trigger_params))

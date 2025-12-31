@@ -2,3 +2,6 @@
 
 python3 -m venv /root/venv
 source /root/venv/bin/activate
+
+
+ssh bot@65.109.233.77
